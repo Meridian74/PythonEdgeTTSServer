@@ -33,6 +33,7 @@ class TTSRequest(BaseModel):
     rate: str = Field(default="+0%", description="Sebesség (+0%, +10%, -10%, stb.)")
     pitch: str = Field(default="+0Hz", description="Hangmagasság")
     volume: str = Field(default="+0%", description="Hangerő")
+    target_duration_ms: Optional[int] = Field(None, description="Cél időtartam ezredmásodpercben")
 
 
 class VoiceInfo(BaseModel):
@@ -156,17 +157,19 @@ async def text_to_speech(
     - **rate**: Sebesség (+0%, +10%, -10%, stb.)
     - **pitch**: Hangmagasság (+0Hz, +10Hz, -10Hz, stb.)
     - **volume**: Hangerő (+0%, +10%, -10%, stb.)
+    - **target_duration_ms**: Kívánt hossza a hangnak (opcionális)
     """
     logger.info(f"TTS kérés: voice={request.voice}, text_length={len(request.text)}")
 
     try:
-        # Hang generálása
-        success, file_path, error_message = await tts_service.text_to_speech(
+        # Hang generálása (itt hívjuk a service-t, ami már kezeli az újragenerálást is)
+        success, file_path, duration_ms, error_message = await tts_service.text_to_speech(
             text=request.text,
             voice=request.voice,
             rate=request.rate,
             pitch=request.pitch,
-            volume=request.volume
+            volume=request.volume,
+            target_duration_ms=request.target_duration_ms
         )
 
         if success and file_path:
@@ -189,7 +192,8 @@ async def text_to_speech(
                 message="Hangfájl sikeresen generálva",
                 file_url=file_url,
                 file_size=file_size,
-                voice=request.voice
+                voice=request.voice,
+                duration_ms=duration_ms
             )
         else:
             return TTSResponse(
@@ -214,17 +218,19 @@ async def text_to_speech_direct(
         voice: str = Query("hu-HU-NoemiNeural"),
         rate: str = Query("+0%"),
         pitch: str = Query("+0Hz"),
+        target_duration_ms: Optional[int] = Query(None),
         background_tasks: BackgroundTasks = None
 ):
     """
     Direct TTS endpoint - visszaadja a hangfájlt közvetlenül
     """
     try:
-        success, file_path, error_message = await tts_service.text_to_speech(
+        success, file_path, duration_ms, error_message = await tts_service.text_to_speech(
             text=text,
             voice=voice,
             rate=rate,
-            pitch=pitch
+            pitch=pitch,
+            target_duration_ms=target_duration_ms
         )
 
         if success and file_path:

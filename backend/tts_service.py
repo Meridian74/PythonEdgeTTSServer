@@ -1,5 +1,4 @@
 # backend/tts_service.py
-import asyncio
 import edge_tts
 import tempfile
 import os
@@ -7,6 +6,7 @@ import time
 from pathlib import Path
 import logging
 from typing import Dict, List, Optional, Tuple
+from mutagen.mp3 import MP3
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +27,10 @@ class EdgeTTSService:
             return self.voices_cache
 
         try:
-            # Itt a legfrissebb list_voices hívást használjuk
             voices = await edge_tts.list_voices()
 
             categorized = []
             for voice in voices:
-                # Robusztus adatkinyerés .get() használatával a KeyError elkerülésére
                 voice_info = {
                     'id': voice.get('ShortName', ''),
                     'name': voice.get('ShortName', ''),
@@ -40,12 +38,10 @@ class EdgeTTSService:
                     'locale': voice.get('Locale', ''),
                     'gender': voice.get('Gender', 'Unknown'),
                     'language': self._extract_language(voice.get('Locale', '')),
-                    # A VoiceType nem minden verzióban kulcs, nézzük meg a Neural szót a névben
                     'neural': 'Neural' in voice.get('ShortName', '') or 'Neural' in voice.get('VoiceType', '')
                 }
                 categorized.append(voice_info)
 
-            # Rendezés
             categorized.sort(key=lambda x: (
                 0 if x['locale'].startswith('hu') else 1,
                 0 if x['neural'] else 1,
@@ -62,60 +58,19 @@ class EdgeTTSService:
             logger.error(f"Hiba a hangok lekérésekor: {e}", exc_info=True)
             return [] if self.voices_cache is None else self.voices_cache
 
-    """Nyelv kinyerése locale-ból"""
     def _extract_language(self, locale: str) -> str:
+        """Nyelv kinyerése locale-ból"""
         parts = locale.split('-')
         return parts[0] if len(parts) > 0 else locale
 
-    """Csak magyar hangok"""
     async def get_hungarian_voices(self) -> List[Dict]:
+        """Csak magyar hangok"""
         all_voices = await self.get_available_voices()
         return [v for v in all_voices if v['locale'].startswith('hu')]
 
-    """
-    Szöveg konvertálása hangfájllá
-
-    Args:
-        text: Felolvasandó szöveg
-        voice: Hang azonosító
-        rate: Sebesség (+0%, +10%, -10%, stb.)
-        pitch: Hangmagasság (+0Hz, +10Hz, -10Hz, stb.)
-        volume: Hangerő (+0%, +10%, -10%, stb.)
-
-    Returns:
-        Tuple: (sikeres, fájl_útvonal, hiba_üzenet)
-    """
-    async def text_to_speech(
-            self,
-            text: str,
-            voice: str = "hu-HU-NoemiNeural",
-            rate: str = "+0%",
-            pitch: str = "+0Hz",
-            volume: str = "+0%"
-    ) -> Tuple[bool, Optional[str], Optional[str]]:
-        if not text or not text.strip():
-            return False, None, "Üres szöveg"
-
-        # Szöveg korlátozása (Edge-TTS limit ~4000 karakter)
-        if len(text) > 4000:
-            text = text[:4000] + "..."
-
-        temp_file = None
+    async def _generate_audio(self, text, voice, rate, pitch, volume, output_path) -> bool:
+        """Belső segédfüggvény a tényleges Edge-TTS híváshoz"""
         try:
-            temp_dir = Path("temp_audio")
-            temp_dir.mkdir(exist_ok=True)
-
-            temp_file = tempfile.NamedTemporaryFile(
-                suffix=".mp3",
-                dir=temp_dir,
-                delete=False
-            )
-            temp_path = temp_file.name
-            temp_file.close()
-
-            logger.info(f"Hang generálása: '{text[:50]}...' -> {voice}")
-
-            # Edge-TTS kommunikáció
             communicate = edge_tts.Communicate(
                 text=text,
                 voice=voice,
@@ -123,31 +78,88 @@ class EdgeTTSService:
                 pitch=pitch,
                 volume=volume
             )
-
-            # Fájl mentése
-            await communicate.save(temp_path)
-
-            # Ellenőrzés
-            if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                file_size = os.path.getsize(temp_path)
-                logger.info(f"Hangfájl létrehozva: {temp_path} ({file_size} bytes)")
-                return True, temp_path, None
-            else:
-                error_msg = "A generált hangfájl üres vagy nem létezik"
-                logger.error(error_msg)
-                return False, None, error_msg
-
+            await communicate.save(output_path)
+            return os.path.exists(output_path) and os.path.getsize(output_path) > 0
         except Exception as e:
-            error_msg = f"Hiba a hanggenerálás során: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            return False, None, error_msg
-        finally:
-            # Temp file descriptor bezárása
-            if temp_file and not temp_file.closed:
-                temp_file.close()
+            logger.error(f"Belső generálási hiba: {e}")
+            return False
 
-    """Fájl törlése"""
+    def _get_mp3_duration_ms(self, file_path) -> int:
+        """MP3 fájl hosszának lekérése ms-ben mutagen segítségével"""
+        try:
+            audio = MP3(file_path)
+            return int(audio.info.length * 1000)
+        except Exception as e:
+            logger.error(f"Hiba a hosszmérésnél: {e}")
+            return 0
+
+    async def text_to_speech(
+            self,
+            text: str,
+            voice: str = "hu-HU-NoemiNeural",
+            rate: str = "+0%",
+            pitch: str = "+0Hz",
+            volume: str = "+0%",
+            target_duration_ms: Optional[int] = None
+    ) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
+        """
+        Szöveg konvertálása hangfájllá méréssel és újragenerálással
+
+        Returns:
+            Tuple: (sikeres, fájl_útvonal, időtartam_ms, hiba_üzenet)
+        """
+        if not text or not text.strip():
+            return False, None, 0, "Üres szöveg"
+
+        if len(text) > 4000:
+            text = text[:4000] + "..."
+
+        temp_dir = Path("temp_audio")
+        temp_dir.mkdir(exist_ok=True)
+
+        # Első generálás az eredeti paraméterekkel
+        temp_file = tempfile.NamedTemporaryFile(suffix=".mp3", dir=temp_dir, delete=False)
+        temp_path = temp_file.name
+        temp_file.close()
+
+        success = await self._generate_audio(text, voice, rate, pitch, volume, temp_path)
+
+        if not success:
+            return False, None, 0, "Első generálás sikertelen"
+
+        # Mérés
+        actual_duration = self._get_mp3_duration_ms(temp_path)
+        logger.info(f"Első generálás kész: {actual_duration}ms (target: {target_duration_ms}ms)")
+
+        # Újragenerálás logikája, ha van célidő és túlléptük
+        if target_duration_ms and actual_duration > target_duration_ms:
+            # Számoljuk ki, hány százalékos gyorsítás kell (pl. 1.15 -> +15%)
+            needed_ratio = actual_duration / target_duration_ms
+            extra_rate_percent = int((needed_ratio - 1) * 100)
+
+            # Korlátozás: max +25%
+            if extra_rate_percent > 25:
+                extra_rate_percent = 25
+
+            if extra_rate_percent > 0:
+                new_rate = f"+{extra_rate_percent}%"
+                logger.info(f"Túllépés észlelve. Újragenerálás rate={new_rate} beállítással...")
+
+                # Régi fájl törlése, új generálása
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+                success = await self._generate_audio(text, voice, new_rate, pitch, volume, temp_path)
+                if success:
+                    actual_duration = self._get_mp3_duration_ms(temp_path)
+                    logger.info(f"Újragenerálás kész: {actual_duration}ms")
+                else:
+                    return False, None, 0, "Újragenerálás sikertelen"
+
+        return True, temp_path, actual_duration, None
+
     async def cleanup_file(self, file_path: str):
+        """Fájl törlése"""
         try:
             if os.path.exists(file_path):
                 os.unlink(file_path)
@@ -158,3 +170,4 @@ class EdgeTTSService:
 
 # Singleton instance
 tts_service = EdgeTTSService()
+
