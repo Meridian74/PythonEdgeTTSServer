@@ -1,6 +1,8 @@
 # backend/main.py
 import os
 import logging
+import sys
+import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional
@@ -11,6 +13,10 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 from pydantic import BaseModel, Field
 from tts_service import tts_service
+
+# Windows-specifikus javítás Python 3.13 / edge-tts számára
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Logging beállítás
 logging.basicConfig(
@@ -212,8 +218,6 @@ async def text_to_speech_direct(
 ):
     """
     Direct TTS endpoint - visszaadja a hangfájlt közvetlenül
-
-    Hasznos a React frontend számára
     """
     try:
         success, file_path, error_message = await tts_service.text_to_speech(
@@ -232,7 +236,6 @@ async def text_to_speech_direct(
                     delay_seconds=300
                 )
 
-            # Hangfájl közvetlen visszaküldése
             return FileResponse(
                 path=file_path,
                 media_type="audio/mpeg",
@@ -249,22 +252,18 @@ async def text_to_speech_direct(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Segédfüggvények
 async def delayed_cleanup(file_path: str, delay_seconds: int = 300):
-    """Fájl törlése késleltetve"""
     import asyncio
     await asyncio.sleep(delay_seconds)
     await tts_service.cleanup_file(file_path)
 
 
 def cleanup_temp_files():
-    """Régi temp fájlok törlése indításkor"""
     try:
         temp_dir = Path("temp_audio")
         if temp_dir.exists():
             for file in temp_dir.iterdir():
                 if file.is_file():
-                    # 1 óránál régebbi fájlok törlése
                     file_age = datetime.now().timestamp() - file.stat().st_mtime
                     if file_age > 3600:
                         file.unlink()
@@ -273,16 +272,10 @@ def cleanup_temp_files():
         logger.warning(f"Temp fájlok takarítása sikertelen: {e}")
 
 
-# Alkalmazás indításkor
 @app.on_event("startup")
 async def startup_event():
-    """Alkalmazás indításkor"""
     logger.info("Edge-TTS API indítása...")
-
-    # Temp fájlok takarítása
     cleanup_temp_files()
-
-    # Hangok cache-elése
     try:
         voices = await tts_service.get_available_voices()
         hungarian = len([v for v in voices if v['locale'].startswith('hu')])
@@ -291,9 +284,7 @@ async def startup_event():
         logger.error(f"Hangok betöltése sikertelen: {e}")
 
 
-# Fő indító
 if __name__ == "__main__":
-    # Fejlesztői szerver indítása
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
@@ -301,4 +292,3 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
-
