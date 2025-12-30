@@ -5,3 +5,4 @@ edge-tts==7.2.1
 aiofiles>=23.2.1
 python-dotenv>=1.0.0
 cors>=1.0.1
+mutagen>=1.47.0
